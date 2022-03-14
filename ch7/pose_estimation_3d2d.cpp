@@ -12,6 +12,8 @@
 #include <g2o/core/optimization_algorithm_gauss_newton.h>
 #include <g2o/solvers/dense/linear_solver_dense.h>
 #include <sophus/se3.hpp>
+#include <ceres/ceres.h>
+#include <ceres/rotation.h>
 #include <chrono>
 
 using namespace std;
@@ -45,14 +47,23 @@ void bundleAdjustmentGaussNewton(
   Sophus::SE3d &pose
 );
 
+// BA by Ceres
+
+void bundleAdjustmentCeres(
+  const VecVector3d &point_3d,
+  const VecVector2d &point_2d,
+  const Mat &K,
+  Sophus::SE3d &pose
+);
+
 int main(int argc, char **argv) {
   if (argc != 5) {
     cout << "usage: pose_estimation_3d2d img1 img2 depth1 depth2" << endl;
     return 1;
   }
   //-- 读取图像
-  Mat img_1 = imread(argv[1], CV_LOAD_IMAGE_COLOR);
-  Mat img_2 = imread(argv[2], CV_LOAD_IMAGE_COLOR);
+  Mat img_1 = imread(argv[1], IMREAD_COLOR);
+  Mat img_2 = imread(argv[2], IMREAD_COLOR);
   assert(img_1.data && img_2.data && "Can not load images!");
 
   vector<KeyPoint> keypoints_1, keypoints_2;
@@ -61,7 +72,7 @@ int main(int argc, char **argv) {
   cout << "一共找到了" << matches.size() << "组匹配点" << endl;
 
   // 建立3D点
-  Mat d1 = imread(argv[3], CV_LOAD_IMAGE_UNCHANGED);       // 深度图为16位无符号数，单通道图像
+  Mat d1 = imread(argv[3], IMREAD_UNCHANGED);       // 深度图为16位无符号数，单通道图像
   Mat K = (Mat_<double>(3, 3) << 520.9, 0, 325.1, 0, 521.0, 249.7, 0, 0, 1);
   vector<Point3f> pts_3d;
   vector<Point2f> pts_2d;
@@ -111,6 +122,16 @@ int main(int argc, char **argv) {
   t2 = chrono::steady_clock::now();
   time_used = chrono::duration_cast<chrono::duration<double>>(t2 - t1);
   cout << "solve pnp by g2o cost time: " << time_used.count() << " seconds." << endl;
+
+  cout << "calling bundle adjusetment by ceres" << endl;
+  Sophus::SE3d pose_ceres;
+  t1 = chrono::steady_clock::now();
+  bundleAdjustmentCeres(pts_3d_eigen, pts_2d_eigen, K, pose_ceres);
+  t2 = chrono::steady_clock::now();
+  time_used = chrono::duration_cast<chrono::duration<double>>(t2 - t1);
+  cout << "solve pnp by ceres cost time: " << time_used.count() << " seconds." << endl;
+
+  
   return 0;
 }
 
@@ -357,3 +378,84 @@ void bundleAdjustmentG2O(
   cout << "pose estimated by g2o =\n" << vertex_pose->estimate().matrix() << endl;
   pose = vertex_pose->estimate();
 }
+
+struct ReprojectionError {
+  ReprojectionError(Eigen::Vector3d point, Eigen::Vector2d observed, Mat K) : _point(point), _observed(observed), _K(K)
+  {}
+
+  // 残差的计算
+  template<typename T>
+  bool operator()(
+    const T *const camera_r, // 模型参数，有3维
+    const T *const camera_t,
+    T *residual) const {
+
+    T pt1[3];
+    pt1[0] = T(_point.x());
+    pt1[1] = T(_point.y());
+    pt1[2] = T(_point.z());
+
+    T pt2[3];
+    ceres::AngleAxisRotatePoint(camera_r, pt1, pt2);
+
+    pt2[0] = pt2[0] + camera_t[0];
+    pt2[1] = pt2[1] + camera_t[1];
+    pt2[2] = pt2[2] + camera_t[2];
+
+    const T xp = T(_K.at<double>(0,0) * (pt2[0] / pt2[2]) + _K.at<double>(0,2));
+    const T yp = T(_K.at<double>(1,1) * (pt2[1] / pt2[2]) + _K.at<double>(1,2));
+
+    const T u = T(_observed.x());
+    const T v = T(_observed.y());
+
+    residual[0] = u - xp;
+    residual[1] = v - yp;
+    return true;
+  }
+
+  const Eigen::Vector3d _point;
+  const Eigen::Vector2d _observed;    // x,y数据
+  const Mat _K;
+};
+
+void bundleAdjustmentCeres(
+  const VecVector3d &point_3d,
+  const VecVector2d &point_2d,
+  const Mat &K,
+  Sophus::SE3d &pose
+)
+{
+  ceres::Problem problem;
+  double rvec[3], tvec[3];
+  for (int i = 0; i < point_2d.size(); i++) {
+    Eigen::Vector2d p2d = point_2d[i];
+    Eigen::Vector3d p3d = point_3d[i];
+    problem.AddResidualBlock(     
+      new ceres::AutoDiffCostFunction<ReprojectionError, 2, 3, 3>(
+        new ReprojectionError(p3d, p2d, K)),
+      nullptr, rvec, tvec);
+  }
+
+  // 配置求解器
+  ceres::Solver::Options options;     // 这里有很多配置项可以填
+  options.linear_solver_type = ceres::DENSE_SCHUR;  // 增量方程如何求解
+  options.minimizer_progress_to_stdout = true;   // 输出到cout
+  ceres::Solver::Summary summary;                // 优化信息
+
+  chrono::steady_clock::time_point t1 = chrono::steady_clock::now();
+  ceres::Solve(options, &problem, &summary);  // 开始优化
+  chrono::steady_clock::time_point t2 = chrono::steady_clock::now();
+  chrono::duration<double> time_used = chrono::duration_cast<chrono::duration<double>>(t2 - t1);
+  cout << "optimization costs time: " << time_used.count() << " seconds." << endl;
+  double quat[4];
+  ceres::AngleAxisToQuaternion(rvec, quat);
+  Eigen::Quaterniond q(quat[0], quat[1], quat[2], quat[3]);
+  Eigen::Vector3d t(tvec[0], tvec[1], tvec[2]);
+  Sophus::SE3d aa(q, t);
+  pose = aa;
+  cout << "pose estimated by ceres =\n" << pose.matrix() << endl;
+
+
+  
+}
+
